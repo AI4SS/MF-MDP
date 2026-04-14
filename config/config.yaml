@@ -1,0 +1,39 @@
+# =============================================================================
+# MF-MDP 配置文件
+# =============================================================================
+
+paths:
+  # 数据集路径
+  event_data_dir: ./data/events
+  mf_data_dir: ./data/test_mf
+  state_trajectory_dir: ./data/test_state_distribution
+  profile_path: ./main/data/profile/cluster_core_user_profile.jsonl
+
+  # 模型路径
+  state_model_checkpoint: ./checkpoints/event_transformer/event_transformer_best.pt
+  policy_model_path: ./models/qwen2-1.5B
+  mf_model_path: ./models/qwen2-1.5B
+  model_base_dir: ./models/
+
+  # 输出和缓存路径
+  output_dir: ./main/result
+  cache_dir: ./cache/text_embeddings
+  pred_state_dir: ./data/pred_state_distribution
+
+api:
+  vllm_base_url: http://localhost:8000/v1
+  vllm_model_name: deepseek-chat
+
+training:
+  # 训练参数
+  encoder_type: bert
+  model_name: bert-base-chinese
+  text_emb_dim: 768
+  d_model: 256
+  nhead: 8
+  num_layers: 3
+  dropout: 0.1
+  max_len: 4096
+  train_batch_size: 4
+  num_epochs: 20
+  lr: 0.00002
