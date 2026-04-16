@@ -5,14 +5,12 @@
 paths:
   # 数据集路径
   event_data_dir: ./data/events
-  mf_data_dir: ./data/test_mf
-  state_trajectory_dir: ./data/test_state_distribution
   profile_path: ./main/data/profile/cluster_core_user_profile.jsonl
 
   # 模型路径
   state_model_checkpoint: ./checkpoints/event_transformer/event_transformer_best.pt
-  policy_model_path: ./models/qwen2-1.5B
-  mf_model_path: ./models/qwen2-1.5B
+  policy_model_path: ./models/qwen2-1.5B-policy
+  mf_model_path: ./models/qwen2-1.5B-mf
   model_base_dir: ./models/
 
   # 输出和缓存路径
