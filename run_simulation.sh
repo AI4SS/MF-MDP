@@ -43,7 +43,7 @@ GENERATE_CACHE=false
 
 # State Transformer 模型路径 (用于生成状态分布缓存)
 # 注意: event_transformer_best.pt 是正确的模型 (训练时使用预编码)
-STATE_MODEL_CHECKPOINT="/root/ICML/checkpoints/event_transformer/event_transformer_best.pt"
+STATE_MODEL_CHECKPOINT="./checkpoints/event_transformer/event_transformer_best.pt"
 
 # 缓存相关路径 (相对于 release 目录)
 MF_DATA_DIR="./data/test_mf"
@@ -56,9 +56,9 @@ TEXT_EMBED_CACHE_DIR="./cache/text_embeddings"
 PYTHON_SCRIPT="main/script/run_mf_mdp.py"
 
 # 模型路径配置
-POLICY_MODEL_PATH="/root/qwen2-1.5B"  # 策略模型路径
-MF_MODEL_PATH="/root/qwen2-1.5B"      # 均值场模型路径
-MODEL_BASE_DIR="/root/ICML/models/"  # 模型基础目录（备用）
+POLICY_MODEL_PATH="/root/qwen2-1.5B-policy"  # 策略模型路径
+MF_MODEL_PATH="/root/qwen2-1.5B-mf"      # 均值场模型路径
+MODEL_BASE_DIR="/root/models/"  # 模型基础目录（备用）
 
 # 数据目录 (自动搜索 batch > 1000 的文件)
 DATA_DIR="./data"
