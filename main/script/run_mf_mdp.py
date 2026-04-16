@@ -39,8 +39,8 @@ for p in [PROJECT_ROOT, MAIN_DIR]:
 
 # 3. 尝试导入推理模块（不提前导入 TrainConfig）
 try:
-    from MF_MDP.state_transition.encoders import build_text_encoder
-    from MF_MDP.state_transition.event_transformer_net import CausalEventTransformerNet
+    from LCT.state_transition.encoders import build_text_encoder
+    from LCT.state_transition.event_transformer_net import CausalEventTransformerNet
     print("✅ [成功] ST-Net 推理模块已成功识别")
 except ImportError as e:
     print(f"❌ [失败] 推理模块导入失败: {e}")
@@ -764,11 +764,11 @@ def load_st_model(device, checkpoint_path=None):
         print(f"   [调试] datasets.event_state_datasets 导入成功: {event_ds_mod.__file__}")
 
         print("   尝试导入 TrainConfig...")
-        from MF_MDP.state_transition.training.train_event_transformer import TrainConfig
+        from LCT.state_transition.training.train_event_transformer import TrainConfig
         print("   TrainConfig 导入成功!")
 
-        from MF_MDP.state_transition.encoders import build_text_encoder
-        from MF_MDP.state_transition.event_transformer_net import CausalEventTransformerNet
+        from LCT.state_transition.encoders import build_text_encoder
+        from LCT.state_transition.event_transformer_net import CausalEventTransformerNet
 
     except ImportError as e:
         print(f"❌ [导入失败] 无法导入 ST-Net 依赖模块: {e}")

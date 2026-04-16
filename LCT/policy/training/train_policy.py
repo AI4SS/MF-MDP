@@ -20,8 +20,8 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.pa
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
-from MF_MDP.policy.policy_actor import PolicyActor
-from MF_MDP.policy.datasets.policy_mf_dataset import PolicyMFDataset, load_and_process_csv_data
+from LCT.policy.policy_actor import PolicyActor
+from LCT.policy.datasets.policy_mf_dataset import PolicyMFDataset, load_and_process_csv_data
 
 
 def custom_collate_fn(batch):

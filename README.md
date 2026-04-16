@@ -36,8 +36,8 @@ Our approach consistently improves long-horizon social simulation and reversal m
 ## 📂 Project Structure
 
 
-- **`MF_MDP/state_transition/`**: State transition model and related training resources.
-- **`MF_MDP/policy/`**: Policy model components.
+- **`LCT/state_transition/`**: State transition model and related training resources.
+- **`LCT/policy/`**: Policy model components.
 - **`datasets/`**: Event-level datasets and processed simulation inputs.
 - **`main/`**:
   - **`data/`**: Input data directory for simulation.
@@ -72,8 +72,13 @@ The shell script will automatically search for JSON files with more than 1000 co
 For state transition training details, please refer to:
 
 ```text
-MF_MDP/state_transition/training/README.md
+LCT/state_transition/training/README.md
 ```
+
+For MF (Mean Field) model training process, please refer to: **[Miracle1207/Mean-Field-LLM](https://github.com/Miracle1207/Mean-Field-LLM)**
+
+This repository provides comprehensive training procedures for the Mean Field policy model, including data preparation, model architecture, and training configurations.
+
 
 ### 2. Run
 
@@ -99,7 +104,7 @@ Key configurations in `run_simulation.sh`:
 To simulate a single event file:
 
 ```bash
-python main/script/run_mf_batch_newstate_policy.py \
+python main/script/run_mf_mdp.py \
     --file_name /path/to/json/file \
     --simulation_start 50 \
     --model 1.5B \

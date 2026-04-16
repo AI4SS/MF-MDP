@@ -18,8 +18,8 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.pa
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
-from MF_MDP.state_transition.encoders import build_text_encoder
-from MF_MDP.state_transition.event_transformer_net import CausalEventTransformerNet
+from LCT.state_transition.encoders import build_text_encoder
+from LCT.state_transition.event_transformer_net import CausalEventTransformerNet
 from datasets.event_state_datasets import (
     EventStateTransitionDataset,
     FullEventDataset,

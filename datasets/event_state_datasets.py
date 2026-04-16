@@ -14,7 +14,7 @@ from tqdm import tqdm
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = logging.getLogger(__name__)
 
-from MF_MDP.state_transition.encoders import build_text_encoder
+from LCT.state_transition.encoders import build_text_encoder
 
 
 # ============================= Pre-encoding utilities =============================

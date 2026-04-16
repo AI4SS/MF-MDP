@@ -22,8 +22,8 @@ ROOT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
-from MF_MDP.state_transition.encoders import build_text_encoder
-from MF_MDP.state_transition.event_transformer_net import CausalEventTransformerNet
+from LCT.state_transition.encoders import build_text_encoder
+from LCT.state_transition.event_transformer_net import CausalEventTransformerNet
 from datasets.event_state_datasets import preencode_all_mf_files, get_cache_path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

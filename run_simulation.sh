@@ -4,9 +4,9 @@
 # ICML 2026 - 仿真运行脚本
 #
 # 此脚本用于运行 mean field 仿真实验
-# 使用 ST-Net 模型实时预测状态分布
+# 支持生成状态分布缓存文件（使用 Transformer 模型）
 #
-# 使用方法: cd /root/MF-MDP && bash main/script/run_simulation.sh
+# 使用方法: cd /root/ICML/release && bash main/script/run_simulation.sh
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -20,14 +20,6 @@ while [ -h "$SCRIPT_SOURCE" ]; do
     [[ $SCRIPT_SOURCE != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
-
-# -----------------------------------------------------------------------------
-# 加载环境变量（如果存在）
-# -----------------------------------------------------------------------------
-if [ -f ".env" ]; then
-    echo "加载环境变量: .env"
-    export $(cat .env | grep -v '^#' | xargs)
-fi
 
 # release 目录是 script 目录的上两级
 # SCRIPT_DIR = .../release/main/script
@@ -45,21 +37,31 @@ echo ""
 # 配置部分
 # -----------------------------------------------------------------------------
 
-# State Transformer 模型路径 (用于实时预测状态分布)
-# 注意: 必须使用 event_transformer_best.pt 模型
-STATE_MODEL_CHECKPOINT=${STATE_MODEL_CHECKPOINT:-"./checkpoints/event_transformer/event_transformer_best.pt"}
+# 1. 生成状态分布缓存的配置
+# 是否在运行仿真前先生成状态分布缓存文件
+GENERATE_CACHE=false
 
-# 仿真配置
+# State Transformer 模型路径 (用于生成状态分布缓存)
+# 注意: event_transformer_best.pt 是正确的模型 (训练时使用预编码)
+STATE_MODEL_CHECKPOINT="/root/ICML/checkpoints/event_transformer/event_transformer_best.pt"
+
+# 缓存相关路径 (相对于 release 目录)
+MF_DATA_DIR="./data/test_mf"
+TRAJ_DATA_DIR="./data/test_state_distribution"
+STATE_CACHE_OUTPUT_DIR="./data/pred_state_distribution"
+TEXT_EMBED_CACHE_DIR="./cache/text_embeddings"
+
+# 2. 仿真配置
 # 默认使用 run_mf_mdp.py 脚本
 PYTHON_SCRIPT="main/script/run_mf_mdp.py"
 
 # 模型路径配置
-POLICY_MODEL_PATH=${POLICY_MODEL_PATH:-"./models/qwen2-1.5B"}  # 策略模型路径
-MF_MODEL_PATH=${MF_MODEL_PATH:-"./models/qwen2-1.5B"}          # 均值场模型路径
-MODEL_BASE_DIR=${MODEL_BASE_DIR:-"./models/"}                  # 模型基础目录（备用）
+POLICY_MODEL_PATH="/root/qwen2-1.5B"  # 策略模型路径
+MF_MODEL_PATH="/root/qwen2-1.5B"      # 均值场模型路径
+MODEL_BASE_DIR="/root/ICML/models/"  # 模型基础目录（备用）
 
 # 数据目录 (自动搜索 batch > 1000 的文件)
-DATA_DIR=${DATA_DIR:-"./data"}
+DATA_DIR="./data"
 
 # 仿真参数
 alg="mf"  # 算法类型: mf, hot, state 等 (使用 mf 或 state 才会加载 ST-Net 模型)
@@ -128,6 +130,49 @@ except Exception as e:
     return 0
 }
 
+# 生成状态分布缓存文件
+function generate_state_cache() {
+    echo ""
+    echo "============================================================================"
+    echo "生成状态分布缓存文件"
+    echo "============================================================================"
+    echo "模型: $STATE_MODEL_CHECKPOINT"
+    echo "MF数据目录: $MF_DATA_DIR"
+    echo "轨迹数据目录: $TRAJ_DATA_DIR"
+    echo "输出目录: $STATE_CACHE_OUTPUT_DIR"
+    echo "============================================================================"
+    echo ""
+
+    # 检查模型文件是否存在
+    if [ ! -f "$STATE_MODEL_CHECKPOINT" ]; then
+        echo "错误: 模型文件不存在: $STATE_MODEL_CHECKPOINT"
+        echo "跳过缓存生成，使用现有数据文件..."
+        return 1
+    fi
+
+    # 生成状态分布缓存
+    poetry run python main/script/generate_state_trajectory.py \
+        --checkpoint "$STATE_MODEL_CHECKPOINT" \
+        --mf_dir "$MF_DATA_DIR" \
+        --traj_dir "$TRAJ_DATA_DIR" \
+        --output_dir "$STATE_CACHE_OUTPUT_DIR" \
+        --cache_dir "$TEXT_EMBED_CACHE_DIR" \
+        --batch_size $batch_size \
+        --warmup_steps 5 \
+        --device "cuda"
+
+    if [ $? -eq 0 ]; then
+        echo ""
+        echo "✓ 状态分布缓存生成成功!"
+        echo "缓存文件保存在: $STATE_CACHE_OUTPUT_DIR"
+        return 0
+    else
+        echo ""
+        echo "✗ 状态分布缓存生成失败"
+        return 1
+    fi
+}
+
 # 运行单个仿真
 function run_simulation() {
     local file_path=$1
@@ -188,8 +233,22 @@ echo "==========================================================================
 echo "开始时间: $(date)"
 echo ""
 
+# Step 1: 生成状态分布缓存 (如果启用)
+if [ "$GENERATE_CACHE" = true ]; then
+    generate_state_cache
+    cache_result=$?
+
+    if [ $cache_result -ne 0 ]; then
+        echo "警告: 缓存生成失败或跳过，将使用现有数据文件"
+    fi
+else
+    echo "缓存生成已禁用 (GENERATE_CACHE=false)"
+    echo "将使用现有的状态分布数据文件"
+fi
+
+echo ""
 echo "============================================================================"
-echo "开始仿真 (使用 ST-Net 实时预测状态分布)"
+echo "开始仿真"
 echo "============================================================================"
 echo "数据目录: $DATA_DIR"
 echo "算法类型: $alg"
