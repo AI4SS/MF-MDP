@@ -2,6 +2,7 @@ import torch
 import openai
 import torch.nn.functional as F
 from collections import Counter
+import numpy as np
 import time
 # from transformers import AutoTokenizer, AutoModelForCausalLM
 # MODEL_PATH = "/mnt/nasdata/qirui/language_model/"
@@ -14,6 +15,96 @@ import os
 import re
 import re
 import sys
+
+# ============================= 清理函数 =============================
+
+def clean_generated_text(text: str) -> str:
+    """
+    清理模型生成的文本，移除不相关的英文内容和数学公式。
+
+    Args:
+        text: 原始生成的文本
+
+    Returns:
+        清理后的文本（只保留中文相关内容）
+    """
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    cleaned_lines = []
+    skip_mode = False  # 是否在跳过模式
+
+    for line in lines:
+        line_stripped = line.strip()
+
+        # 空行处理
+        if not line_stripped:
+            if not skip_mode:
+                cleaned_lines.append(line)
+            continue
+
+        # 检测是否包含英文或数学公式的关键特征
+        # 特征1: 英文单词占多数（超过70%的字符是英文）
+        english_chars = sum(1 for c in line_stripped if c.isalpha() and ord(c) < 128)
+        total_chars = sum(1 for c in line_stripped if c.isalpha())
+        if total_chars > 0 and english_chars / total_chars > 0.7:
+            skip_mode = True
+            continue
+
+        # 特征2: 包含数学公式标记 ($, \frac, ^{, }_{, \\)
+        math_keywords = ['$', r'\frac', '^', '{', '}', r'\\', 'sqrt', 'sum', 'int']
+        if any(keyword in line for keyword in math_keywords):
+            skip_mode = True
+            continue
+
+        # 特征3: 英文句子模式（如 "If we know that..."）
+        if line_stripped.startswith(('If ', 'When ', 'Given that', 'Let ')):
+            skip_mode = True
+            continue
+
+        # 特征4: 英语问题句式
+        if re.search(r'\b(What|How|Why|Where|When|Find|Calculate|Solve)\s+\w+', line_stripped):
+            skip_mode = True
+            continue
+
+        # 如果行是有效的中文内容，添加到结果中
+        if not skip_mode:
+            cleaned_lines.append(line)
+        else:
+            # 如果遇到连续多个空行或无效行，不添加
+            # 检查上一行是否也是空的
+            if cleaned_lines and cleaned_lines[-1].strip():
+                # 添加空行保持段落结构
+                cleaned_lines.append('')
+
+    # 合并清理后的行
+    cleaned_text = '\n'.join(cleaned_lines)
+
+    # 移除末尾的数学题残留
+    # 查找并移除以英文开头的段落
+    math_patterns = [
+        r'If \$[a-z]+\$.*?\n',
+        r'Given that.*?\n',
+        r'Let the.*?\n',
+        r'To find the value of.*?\n',
+        r'\$[^\$]*\$.*?\n',
+        r'If we know.*?\n',
+    ]
+    for pattern in math_patterns:
+        cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.MULTILINE | re.IGNORECASE)
+
+    # 移除重复的总结结尾
+    # 检查是否有"综上所述"开头的重复段落
+    summary_end_pattern = r'(综上所述[，。].*?)(\n\s*综上所述[，。].*?)+'
+    cleaned_text = re.sub(summary_end_pattern, r'\1', cleaned_text, flags=re.MULTILINE | re.IGNORECASE)
+
+    # 清理多余的空行
+    cleaned_text = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned_text)
+    cleaned_text = cleaned_text.strip()
+
+    return cleaned_text
+
 
 # 【新增辅助函数】为了代码整洁，将 API 调用逻辑抽离
 async def call_api_mean_field(client, model_type, prompt):
@@ -35,12 +126,10 @@ async def call_api_mean_field(client, model_type, prompt):
             max_tokens=400,
         )
         content = response.choices[0].message.content
-        if is_deepseek:
-            content = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL)
-        return content.strip().replace("\n", "").replace("**", "")
+        return content
     except Exception as e:
-        print(f"Mean Field API 调用失败: {e}")
-        return "（API 总结失败，请检查网络）"
+        print(f"API调用失败: {e}")
+        return f"总结生成失败: {str(e)}"
 
 
 def calculate_mean_field(
@@ -110,6 +199,10 @@ def calculate_mean_field(
         if tokenizer is None:
             return "（错误：缺少本地分词器）", torch.tensor(0., device=device)
         generated_texts = model_generate(prompt, model, tokenizer, device)
+
+        # --- 清理生成的内容，移除不相关的英文内容 ---
+        generated_texts = clean_generated_text(generated_texts)
+
         # print("gen:",generated_texts)
         # sys.exit(0)
         return generated_texts, torch.tensor([0.], device=device)
@@ -318,14 +411,17 @@ def build_state(item, user_profile_dict=None, user_profile_list=None):
     )
     return state
 
-def build_prompt(state, topic, hot_comment, mean_field, related_cases_info, alg="none", model_type=None, state_dist=None):
+def build_prompt(state, topic, hot_comment, mean_field, related_cases_info, alg="none", model_type=None, state_dist=None, individual_state_dist=None):
 # def build_prompt(state, topic, hot_comment, mean_field, related_cases_info, alg="none", model_type=None):
     """
     精简优化版 Prompt。
     保留：1. 积极/中立/消极引导 2. 转发/评论输出格式约束。
+
+    新增参数:
+        individual_state_dist: 个体态度预测分布 [pos_prob, neu_prob, neg_prob]，用于引导单个agent的情绪倾向
     """
     prompt = f"当前讨论的话题是：{topic}\n"
-    
+
     if hot_comment and hot_comment != "暂无最新热门评论":
         prompt += f"热门背景参考：{hot_comment}\n"
     if mean_field and mean_field != '' and mean_field != ['']:
@@ -339,7 +435,7 @@ def build_prompt(state, topic, hot_comment, mean_field, related_cases_info, alg=
             pos_pct = f"{state_dist[0]*100:.1f}%"
             neu_pct = f"{state_dist[1]*100:.1f}%"
             neg_pct = f"{state_dist[2]*100:.1f}%"
-            
+
             dist_text = (
                 f"【群体情绪统计分布数据】：积极占比 {pos_pct}，中立占比 {neu_pct}，消极占比 {neg_pct}。"
                 f"请注意：上述统计数据是由社会动力学模型计算得出的群体真实现状，你的总结必须与此数据分布保持一致。\n"
@@ -352,15 +448,32 @@ def build_prompt(state, topic, hot_comment, mean_field, related_cases_info, alg=
 
     if related_cases_info:
         prompt += f"相关案例：{related_cases_info}\n"
-        
+
+    # --- 网友资料（完整的用户画像，保留原有的所有信息）---
     prompt += f"网友资料：{state}\n"
-    
+
+    # --- 新增：个体态度预测引导（在用户画像之后，作为额外补充）---
+    if individual_state_dist is not None:
+        # 个体态度分布 [pos_prob, neu_prob, neg_prob]
+        pos_prob, neu_prob, neg_prob = individual_state_dist
+        # 确定主要态度倾向
+        max_idx = int(np.argmax([pos_prob, neu_prob, neg_prob]))
+        state_cn_map = {0: "积极", 1: "中立", 2: "消极"}
+        main_state = state_cn_map[max_idx]
+
+        # 添加个体态度引导（作为对用户画像的补充说明）
+        individual_guidance = (
+            f"【基于你的画像特征，你对当前话题可能的态度倾向】：{main_state}情绪 "
+            f"(积极:{pos_prob*100:.1f}%, 中立:{neu_prob*100:.1f}%, 消极:{neg_prob*100:.1f}%)。\n"
+        )
+        prompt += individual_guidance
+
     # # --- 1. 心理倾向引导 ---
     # state_instruction = ""
     # if pred_state is not None:
     #     # 映射预测状态
     #     state_cn = {"Positive": "积极", "Neutral": "中立", "Negative": "消极"}.get(pred_state, pred_state)
-    #     state_instruction = f"【心理状态引导】：根据预测，你对此话题的心理倾向处于“{state_cn}”状态。\n"
+    #     state_instruction = f"【心理状态引导】：根据预测，你对此话题的心理倾向处于"{state_cn}"状态。\n"
 
     # --- 2. 转发/评论格式约束 ---         f"{state_instruction}"
     format_instruction = (
