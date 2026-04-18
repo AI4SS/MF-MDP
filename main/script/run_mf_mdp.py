@@ -103,12 +103,14 @@ def prepare_profile_dict():
     加载聚类用户画像数据：直接从 JSONL 文件读取 user_id -> profile 映射
     返回 (profile_dict, profile_list) 用于精确匹配和随机兜底
     """
-    # 从配置文件读取路径，否则使用默认路径
+    # 从配置文件读取路径
     profile_path_default = config.get('paths.profile_path') if config else None
     if profile_path_default:
+        # 配置路径已经是相对于项目根目录的，直接使用
         jsonl_path = profile_path_default
     else:
-        jsonl_path = os.path.join(BASE_DIR, "main/data/profile/cluster_core_user_profile.jsonl")
+        # 兜底路径：相对于项目根目录，使用 ./data/profile/...
+        jsonl_path = os.path.join(BASE_DIR, "data/profile/cluster_core_user_profile.jsonl")
 
     profile_dict = {}
     profile_list = []
@@ -233,12 +235,48 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
         item = sorted_tweets[idx]  # 获取当前数据项
         current_uid = str(item.get('uid', ''))
         
-        # 向量处理逻辑（保持不变）
-        raw_vec = uid_to_vec.get(current_uid, np.zeros(expected_feat_dim))
-        if len(raw_vec) < expected_feat_dim:
-            profile_vec = np.pad(raw_vec, (0, expected_feat_dim - len(raw_vec)), 'constant')
+        # 向量处理逻辑（增强版：当uid_to_vec为空时，使用文本编码器编码profile_text）
+        if uid_to_vec and current_uid in uid_to_vec:
+            # 方法1: 使用预训练的用户画像向量
+            raw_vec = uid_to_vec.get(current_uid, np.zeros(expected_feat_dim))
+            if len(raw_vec) < expected_feat_dim:
+                profile_vec = np.pad(raw_vec, (0, expected_feat_dim - len(raw_vec)), 'constant')
+            else:
+                profile_vec = raw_vec[:expected_feat_dim]
+        elif st_model_bundle and st_encoder:
+            # 方法2: 当没有预训练向量时，使用文本编码器实时编码用户画像文本
+            # 获取用户的描述文本（优先使用profile_text，其次使用user_description）
+            profile_text = item.get('profile_text', '') or item.get('user_description', '未知')
+            if not profile_text:
+                profile_text = "未提供描述"
+
+            # 使用st_encoder编码用户画像文本
+            tokens = st_encoder.tokenizer(
+                [profile_text],
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt"
+            ).to(device)
+
+            with torch.no_grad():
+                raw_vec_tensor = st_encoder(tokens["input_ids"], tokens.get("attention_mask"))
+                if isinstance(raw_vec_tensor, tuple):
+                    raw_vec_tensor = raw_vec_tensor[0]
+                if raw_vec_tensor.dim() == 3:
+                    raw_vec_tensor = raw_vec_tensor[:, 0, :]
+                profile_vec = raw_vec_tensor.squeeze(0).cpu().numpy()  # (768,)
         else:
-            profile_vec = raw_vec[:expected_feat_dim]
+            # 方法3: 兜底：使用零向量
+            raw_vec = np.zeros(expected_feat_dim)
+            profile_vec = raw_vec
+
+        # --- 调试：检查profile_vec是否为全零 ---
+        if np.all(profile_vec == 0):
+            if current_batch_size == 0 or idx == sampled_indices[0]:  # 只打印一次
+                print(f"⚠️  警告: Agent {idx} 的 profile_vec 为全零向量！")
+                print(f"   → 原因: uid_to_vec为空且无法编码profile_text")
+                print(f"   → 所有Agent将使用相同的零向量，ST-Net无法区分个体差异")
 
         # === 核心修改：区分新旧数据源 ===
         
@@ -295,14 +333,19 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
     
     results = []
     total_steps = (len(agents) + batch_size - 1) // batch_size
-    mean_field = '' 
+    mean_field = ''
     mf_loss = torch.tensor([0.], device=device)
 
-    # 初始群体分布 mu_prev
+    # 初始群体分布 mu_prev (用于ST-Net的时序输入)
     if st_model_bundle:
         mu_prev = torch.tensor([[0.33, 0.34, 0.33]], device=device)
     else:
         mu_prev = None
+
+    # 初始化累积群体分布（用于Prompt中显示的"群体情绪统计分布数据"）
+    # 这是所有历史Agent的累积统计
+    cumulative_state_counts = torch.zeros(3, device=device)  # [积极, 中立, 消极] 的累积计数
+    cumulative_agent_count = 0  # 已处理的Agent总数
 
     # 初始化 Client
     if "gpt" in model_type:
@@ -343,53 +386,68 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
                 latest_hot_comment_texts = [all_hot_comment] * current_batch_size
 
         # --- 3. 调用 build_state (传入 profile_list 用于随机兜底) ---
+        # 保留原始用户画像作为基础信息，但将被ST-Net预测的个体态度覆盖
         batch_states = [build_state(agent, user_profile_dict, user_profile_list) for agent in batch_agents_list]
 
         # --- 4. 状态转移预测 (优先级: ST-Net > 默认值) ---
-        batch_predicted_states = [None] * current_batch_size
-        mu_curr_dist = [0.33, 0.33, 0.34] # 默认兜底
+        # batch_predicted_individual_states: 每个agent的预测个体态度分布
+        batch_predicted_individual_states = [None] * current_batch_size
+        # batch_state_labels: 每个agent的预测状态标签 (Positive/Neutral/Negative)
+        batch_state_labels = [None] * current_batch_size
+        mu_curr_dist = [0.33, 0.33, 0.34] # 默认兜底（宏观分布）
         used_source = "DEFAULT"  # 追踪数据来源
 
-        # [优先级1] 使用 ST-Net 模型预测
+        # [优先级1] 使用 ST-Net 模型预测每个agent的个体态度
         if st_model_bundle and st_model and st_encoder:
             try:
                 # ---- 强健版：确保所有输入都是正确的 (B, T, D) 形状 ----
 
-                # ---- mu_prev_seq: 强制变成 (1,1,3) ----
+                # ---- mu_prev_seq: 扩展到 (batch_size, 1, 3) ----
                 if mu_prev is None:
                     mu_prev = torch.tensor([[0.33, 0.34, 0.33]], device=device, dtype=torch.float32)
                 if mu_prev.dim() == 1:          # (3,)
                     mu_prev = mu_prev.unsqueeze(0)   # (1,3)
-                mu_prev_seq = mu_prev.unsqueeze(1)   # (1,1,3)
+                # 扩展到batch_size
+                mu_prev = mu_prev.expand(current_batch_size, -1)  # (batch_size, 3)
+                mu_prev_seq = mu_prev.unsqueeze(1)   # (batch_size, 1, 3)
 
-                # ---- text_emb: 强制变成 (1,1,768) ----
+                # ---- text_emb: 扩展到 (batch_size, 1, 768) ----
                 mf_input_text = " ".join(mean_field) if isinstance(mean_field, list) else mean_field
                 if not mf_input_text:
                     mf_input_text = "目前尚无舆论总结。"
 
-                tokens = st_encoder.tokenizer([mf_input_text], padding=True, truncation=True,
+                tokens = st_encoder.tokenizer([mf_input_text] * current_batch_size, padding=True, truncation=True,
                                               max_length=128, return_tensors="pt").to(device)
 
                 with torch.no_grad():
                     text_emb = st_encoder(tokens["input_ids"], tokens.get("attention_mask"))
                     if isinstance(text_emb, tuple):
                         text_emb = text_emb[0]
-                    # 常见两种输出：(1,768) 或 (1,L,768)
+                    # 常见两种输出：(batch_size, 768) 或 (batch_size, L, 768)
                     if text_emb.dim() == 3:
-                        text_emb = text_emb[:, 0, :]          # 取 CLS -> (1,768)
-                    text_emb_seq = text_emb.unsqueeze(1)      # (1,1,768)
+                        text_emb = text_emb[:, 0, :]          # 取 CLS -> (batch_size, 768)
+                    text_emb_seq = text_emb.unsqueeze(1)      # (batch_size, 1, 768)
 
-                # ---- agent_feat_seq: pooled 后变成 (1,1,768) ----
-                # 将所有 agent 的特征聚合成一个向量（因为是预测整个群体的分布）
+                # ---- agent_feat_seq: 每个agent独立特征 (batch_size, 1, 768) ----
+                # 不再聚合，每个agent使用自己的profile特征进行独立预测
                 agent_feat = torch.stack([
                     torch.tensor(a['profile_vec'], dtype=torch.float32, device=device)
                     for a in batch_agents_list
-                ], dim=0)                         # (N,768)
-                agent_feat_seq = agent_feat.mean(dim=0).unsqueeze(0).unsqueeze(1)   # (1,1,768)
+                ], dim=0)                         # (batch_size, 768)
+                agent_feat_seq = agent_feat.unsqueeze(1)   # (batch_size, 1, 768)
+
+                # --- 调试：检查agent_feat是否有差异 ---
+                # 检查前3个agent的profile_vec是否相同
+                agent_feat_diff = agent_feat[:3].sum(dim=1)  # 检查向量是否相同
+                if agent_feat_diff.abs().max() < 1e-6:
+                    print(f"⚠️  警告: 前3个Agent的profile_vec完全相同，模型无法区分个体差异")
+                else:
+                    print(f"✅ 确认: 前3个Agent的profile_vec有差异")
 
                 # ---- 打印调试信息 ----
                 print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                print(f"🔍 ST-Net 模型推理 - 张量形状调试:")
+                print(f"🔍 ST-Net 模型推理 - 每个Agent独立预测模式:")
+                print(f"   Batch size: {current_batch_size}")
                 print(f"   mu_prev shape: {mu_prev.shape} (dim: {mu_prev.dim()})")
                 print(f"   mu_prev_seq shape: {mu_prev_seq.shape} (dim: {mu_prev_seq.dim()})")
                 print(f"   text_emb shape: {text_emb.shape} (dim: {text_emb.dim()})")
@@ -404,12 +462,23 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
                                        text_emb_seq=text_emb_seq,
                                        agent_feat_seq=agent_feat_seq)
 
-                # mu_pred shape: (B, T, 3) = (1, 1, 3)
-                mu_prev = mu_pred[:, 0, :]                 # (1,3)
-                mu_curr_dist = mu_pred[0, 0].cpu().tolist()  # 转为 list
-                # 对于当前批次，使用相同的分布（因为模型只预测了一个时间步）
+                # mu_pred shape: (batch_size, 1, 3) = (batch_size, 1, 3)
+                # 提取每个agent的预测分布
+                individual_preds = mu_pred[:, 0, :]  # (batch_size, 3)
+
+                # 更新mu_prev为当前批次的平均分布（用于下一轮）
+                # 宏观分布更新逻辑：mu_prev_{t+1} = mean(个体预测_t)
+                # 这表示群体态度随时间的演变，而不是所有历史数据的全局平均
+                mu_prev = individual_preds.mean(dim=0, keepdim=True)  # (1, 3)
+                mu_curr_dist = mu_prev[0].cpu().tolist()  # 转为 list，用于显示宏观分布
+
+                # 为每个agent提取其个体态度分布和标签
                 for i in range(current_batch_size):
-                    batch_predicted_states[i] = IDX2STATE[int(np.argmax(mu_curr_dist))]
+                    agent_pred_dist = individual_preds[i].cpu().tolist()  # [pos_prob, neu_prob, neg_prob]
+                    batch_predicted_individual_states[i] = agent_pred_dist
+                    # 获取最大概率对应的状态标签
+                    state_idx = int(np.argmax(agent_pred_dist))
+                    batch_state_labels[i] = IDX2STATE[state_idx]
 
                 used_source = "ST-NET-MODEL"
             except Exception as e:
@@ -451,9 +520,26 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
             print(f"╔══════════════════════════════════════════════════════════════════════════════╗")
             print(f"║  ✅✅✅  ST-NET 模型预测成功  ✅✅✅                                                  ║")
             print(f"╠══════════════════════════════════════════════════════════════════════════════╣")
-            print(f"║  Batch {step+1} 状态分布 (由 ST-Net 模型预测)                                         ║")
+            print(f"║  Batch {step+1} 宏观群体状态分布 (本批次所有Agent预测的平均）                    ║")
             print(f"╠══════════════════════════════════════════════════════════════════════════════╣")
             print(f"║  积极: {pos_pct:>6}  │  中立: {neu_pct:>6}  │  消极: {neg_pct:>6}                     ║")
+            print(f"╠══════════════════════════════════════════════════════════════════════════════╣")
+            print(f"╠══════════════════════════════════════════════════════════════════════════════╣")
+            print(f"║  📊 每个Agent的个体态度预测 (前5个示例)                                     ║")
+            print(f"╠══════════════════════════════════════════════════════════════════════════════╣")
+
+            # 显示前5个agent的个体态度预测
+            for i in range(min(5, current_batch_size)):
+                if batch_predicted_individual_states[i] is not None:
+                    pred_dist = batch_predicted_individual_states[i]
+                    pred_pos, pred_neu, pred_neg = [f"{x*100:.1f}%" for x in pred_dist]
+                    pred_label = batch_state_labels[i] if batch_state_labels[i] else "Unknown"
+                    print(f"║  Agent {i}: 积极={pred_pos:>6}, 中立={pred_neu:>6}, 消极={pred_neg:>6} → {pred_label:<20} ║")
+                else:
+                    print(f"║  Agent {i}: [无预测]                                                              ║")
+
+            if current_batch_size > 5:
+                print(f"║  ... (其余 {current_batch_size - 5} 个 Agent 略)                                          ║")
             print(f"╚══════════════════════════════════════════════════════════════════════════════╝")
             print(f"")
         else:
@@ -467,13 +553,35 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
             print(f"╠══════════════════════════════════════════════════════════════════════════════╣")
             print(f"║  积极: {pos_pct:>6}  │  中立: {neu_pct:>6}  │  消极: {neg_pct:>6}                     ║")
             print(f"╠══════════════════════════════════════════════════════════════════════════════╣")
-            print(f"║  💡 提示: 状态分布未动态预测，所有 Agent 使用相同分布                                ║")
+            print(f"║  💡 提示: 所有 Agent 使用固定画像状态，未使用个体态度预测                          ║")
             print(f"╚══════════════════════════════════════════════════════════════════════════════╝")
             print(f"")
 
         # --- 构建提示词 ---
-        # 1. 主实验组：传入 mu_curr_dist，使其能在 Prompt 中显示统计数据
-        print(f"📝 构建提示词 (实验组 - 包含状态分布)...")
+        # 计算累积群体分布（用于Prompt中的"群体情绪统计分布数据"）
+        if used_source == "ST-NET-MODEL" and batch_predicted_individual_states:
+            # 将当前batch所有Agent的个体预测转换为tensor
+            batch_predictions_tensor = torch.tensor(
+                batch_predicted_individual_states,  # (batch_size, 3)
+                dtype=torch.float32,
+                device=device
+            )
+
+            # 累加到全局统计
+            cumulative_state_counts += batch_predictions_tensor.sum(dim=0)  # (3,)
+            cumulative_agent_count += current_batch_size
+
+            # 计算累积分布
+            cumulative_dist = (cumulative_state_counts / cumulative_agent_count).cpu().tolist()  # [pos, neu, neg]
+            # 打印累积分布信息
+            pos_pct, neu_pct, neg_pct = [f"{x*100:.1f}%" for x in cumulative_dist]
+            print(f"📊 累积群体分布（{cumulative_agent_count}个Agent）: 积极={pos_pct}, 中立={neu_pct}, 消极={neg_pct}")
+        else:
+            # ST-NET不可用时，使用默认分布
+            cumulative_dist = [0.33, 0.33, 0.34]
+
+        # 1. 主实验组：传入 cumulative_dist（累积分布）和 individual_state_dist
+        print(f"📝 构建提示词 (实验组 - 包含群体累积分布和个体状态分布)...")
         batch_prompts = [
             build_prompt(
                 state,
@@ -483,11 +591,12 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
                 related_info,
                 alg=alg,
                 model_type=model_type,
-                state_dist=mu_curr_dist  # <--- [关键] 传入当前计算出的分布
+                state_dist=cumulative_dist,  # <--- [关键] 传入累积的群体分布（所有历史Agent）
+                individual_state_dist=batch_predicted_individual_states[i] if batch_predicted_individual_states[i] is not None else None  # <--- 传入个体态度预测
             )
-            for state, latest_hot, related_info in zip(
+            for i, (state, latest_hot, related_info) in enumerate(zip(
                 batch_states, latest_hot_comment_texts, related_cases_infos
-            )
+            ))
         ]
 
         # 打印第一个提示词示例（验证状态分布是否正确注入）
@@ -608,6 +717,10 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
             })
 
         if "mf" in alg:
+            # 使用前面在prompt构建时计算好的累积分布
+            # 累积分布：所有历史Agent的个体态度预测的平均
+            current_cumulative_dist = cumulative_dist
+
             mean_field, mf_loss = calculate_mean_field(
                 topic,
                 batch_states,
@@ -619,7 +732,7 @@ def run_simulation(tweets, comment_n, tokenizer, a_model, mf_model,
                 model_type=model_type,
                 client=client,
                 tokenizer=tokenizer,
-                state_distribution=mu_curr_dist
+                state_distribution=current_cumulative_dist  # 使用累积分布（所有历史Agent）
             )
             
     return pd.DataFrame(results)
@@ -844,12 +957,13 @@ def load_st_model(device, checkpoint_path=None):
 def runner(alg, model_type, test_name, comment_n, a_MODEL_NAME, mf_MODEL_NAME,
            generate_true=True, st_model_path=None):
     # 直接使用模型名称，不拼接 MODEL_PATH
-    if os.path.isabs(a_MODEL_NAME):
+    # 如果路径已经是绝对路径或以 ./ 开头的相对路径，则直接使用
+    if os.path.isabs(a_MODEL_NAME) or a_MODEL_NAME.startswith('./'):
         a_model_name = a_MODEL_NAME
     else:
         a_model_name = os.path.join(MODEL_PATH, a_MODEL_NAME) if MODEL_PATH else a_MODEL_NAME
 
-    if os.path.isabs(mf_MODEL_NAME):
+    if os.path.isabs(mf_MODEL_NAME) or mf_MODEL_NAME.startswith('./'):
         mf_model_name = mf_MODEL_NAME
     else:
         mf_model_name = os.path.join(MODEL_PATH, mf_MODEL_NAME) if MODEL_PATH else mf_MODEL_NAME
